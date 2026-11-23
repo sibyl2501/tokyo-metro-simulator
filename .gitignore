@@ -18,3 +18,9 @@ build/
 
 # macOS
 .DS_Store
+
+# Agent local config & runtime user data
+.agents/
+data/user_choices.jsonl
+data/preference_model.pt
+

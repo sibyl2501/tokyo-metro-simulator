@@ -1,11 +1,17 @@
-"""Crisp Tokyo Metro-style SVG schematic route map renderer.
+"""東京メトロ風の路線図（SVG）を動的生成するレンダラーモジュール.
 
-Renders:
-- Ginza Line (#FF9500) and Marunouchi Line + Honancho Branch (#F62E36)
-- Official transfer pills (same-name and different-name dashed connectors)
-- Highlighted active route (with glow, start/end pins, and active transfer markers)
-- Optional ghost comparison overlay of the baseline (before-change) route
-- Clear visual badges for disabled transfers and closed track segments
+外部の地図ライブラリに依存せず、自己完結したレスポンシブ SVG 文字列を組み立てて
+Streamlit 上にシャープに表示します。
+
+【レイヤーの描画順（奥 -> 手前）】
+SVG は後から記述した要素が上に重なるため、見やすさを保つために次の順番で描画しています。
+  0. 背景グリッド & 左上の凡例ボックス
+  1. ベース線路（通常区間は路線カラー、閉鎖区間は点線＋赤い ✕ バッジ）
+  2. 変更前（制約なし）経路の青い破線オーバーレイ（制約によって経路が変わったときのみ）
+  3. 現在選択中の経路ハイライト（白い縁取り＋発光フィルター付き太線）
+  4. 公式乗換コネクタ（同一駅はカプセル枠、異駅名は破線。無効化時は赤い ✕、使用時は「乗換」バッジ）
+  5. 駅ノード（白丸＋路線カラー枠）と駅名ラベル
+  6. 出発駅（「発」緑ピン）と目的駅（「着」青ピン）の吹き出しバッジ
 """
 
 from __future__ import annotations
@@ -26,14 +32,16 @@ def render_metro_svg(
     origin_station: Optional[str] = None,
     destination_station: Optional[str] = None,
 ) -> str:
-    """Return a self-contained responsive SVG string representing the route map."""
+    """現在の路線網・探索経路・制約状態を反映した SVG 文字列を生成して返す."""
     disabled_tr: Set[str] = set(disabled_transfers or ())
     closed_seg: Set[str] = set(closed_segments or ())
 
+    # 現在ハイライト表示する経路の構成要素（区間・乗換・駅ノード）を高速判定用に set 化
     active_seg_ids: Set[str] = set(active_route.segment_ids) if active_route else set()
     active_tr_ids: Set[str] = set(active_route.transfer_ids) if active_route else set()
     active_node_ids: Set[str] = set(active_route.node_ids) if active_route else set()
 
+    # 制約あり／なしで経路が実際に変化した場合のみ、変更前の経路を青い破線で重ね描きする
     baseline_seg_ids: Set[str] = set()
     baseline_tr_ids: Set[str] = set()
     show_baseline = (
@@ -45,15 +53,17 @@ def render_metro_svg(
         baseline_seg_ids = set(baseline_route.segment_ids)
         baseline_tr_ids = set(baseline_route.transfer_ids)
 
+    # 経路が選ばれているときは、無関係な駅や線路の透明度を下げて選択経路を際立たせる
     has_active = active_route is not None
     parts: list[str] = []
 
+    # SVG ルート要素（viewBox="0 0 1260 600" により画面幅に合わせて自動スケーリング）
     parts.append(
         """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1260 600" """
         """style="width:100%;height:auto;background:#FAFBFC;border:1px solid #E2E8F0;border-radius:14px;font-family:-apple-system,BlinkMacSystemFont,'Hiragino Sans','Yu Gothic',sans-serif;">"""
     )
 
-    # Defs: glow filter + hatch pattern
+    # フィルター定義（routeGlow: 選択経路の柔らかい光彩、softShadow: バッジ類の軽い影）
     parts.append(
         """<defs>
   <filter id="routeGlow" x="-20%" y="-20%" width="140%" height="140%">
@@ -69,7 +79,7 @@ def render_metro_svg(
 </defs>"""
     )
 
-    # Subtle background grid
+    # 薄い方眼グリッド（路線図の空間的な見やすさを補助）
     parts.append('<g opacity="0.35">')
     for gx in range(60, 1260, 80):
         parts.append(f'<line x1="{gx}" y1="20" x2="{gx}" y2="580" stroke="#E2E8F0" stroke-width="1"/>')
@@ -77,7 +87,7 @@ def render_metro_svg(
         parts.append(f'<line x1="20" y1="{gy}" x2="1240" y2="{gy}" stroke="#E2E8F0" stroke-width="1"/>')
     parts.append("</g>")
 
-    # Map title & legend box (top-left)
+    # 左上のタイトル & 凡例カード
     parts.append(
         """<g transform="translate(24, 20)">
   <rect x="0" y="0" width="388" height="104" rx="10" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.2" filter="url(#softShadow)"/>
@@ -98,7 +108,7 @@ def render_metro_svg(
 </g>"""
     )
 
-    # 1. Base track segments
+    # レイヤー 1: ベース線路（全乗車区間）
     for seg in graph.segments.values():
         na = graph.nodes[seg.node_a]
         nb = graph.nodes[seg.node_b]
@@ -107,6 +117,7 @@ def render_metro_svg(
         is_active = seg.id in active_seg_ids
 
         if is_closed:
+            # 閉鎖中の区間はグレーの点線にし、中点に赤い ✕ マークを配置
             parts.append(
                 f'<line x1="{na.x}" y1="{na.y}" x2="{nb.x}" y2="{nb.y}" '
                 f'stroke="#CBD5E1" stroke-width="6" stroke-dasharray="6 6" stroke-linecap="round">'
@@ -119,6 +130,7 @@ def render_metro_svg(
                 f"<title>区間閉鎖: {html.escape(seg.label)}</title></g>"
             )
         else:
+            # 選択経路に含まれない区間は薄く（opacity=0.26）表示して主役を引き立てる
             opacity = "1.0" if (not has_active or is_active) else "0.26"
             width = "6.5" if not has_active else ("5.5" if not is_active else "6.5")
             parts.append(
@@ -127,7 +139,7 @@ def render_metro_svg(
                 f"<title>{html.escape(seg.label)}</title></line>"
             )
 
-    # 2. Baseline (before-change) ghost overlay if route changed
+    # レイヤー 2: 変更前（制約なし）経路の青い破線オーバーレイ（迂回の違いを視覚化）
     if show_baseline and baseline_route is not None:
         for edge in baseline_route.edges:
             na = graph.nodes[edge.source]
@@ -144,7 +156,7 @@ def render_metro_svg(
                     f'stroke="#2563EB" stroke-width="3.5" stroke-dasharray="4 4" opacity="0.7"/>'
                 )
 
-    # 3. Active route highlight tracks
+    # レイヤー 3: 現在選択中ルートのハイライト線路（白縁＋発光フィルター付き太線）
     if active_route is not None:
         for edge in active_route.edges:
             if edge.kind != "ride":
@@ -152,7 +164,7 @@ def render_metro_svg(
             na = graph.nodes[edge.source]
             nb = graph.nodes[edge.target]
             color = graph.lines[edge.line_id].color if edge.line_id else "#0F172A"
-            # Outer white halo + colored glow bar
+            # 背景と交差しても視認しやすいよう、まず白い太線を敷いてから路線カラーの線を重ねる
             parts.append(
                 f'<line x1="{na.x}" y1="{na.y}" x2="{nb.x}" y2="{nb.y}" '
                 f'stroke="#FFFFFF" stroke-width="14" stroke-linecap="round" opacity="0.9"/>'
@@ -162,7 +174,7 @@ def render_metro_svg(
                 f'stroke="{color}" stroke-width="9.5" stroke-linecap="round" filter="url(#routeGlow)"/>'
             )
 
-    # 4. Transfer connectors
+    # レイヤー 4: 公式乗換コネクタ（同一駅カプセル / 異駅名破線）と状態バッジ
     for tr in graph.transfers.values():
         na = graph.nodes[tr.node_a]
         nb = graph.nodes[tr.node_b]
@@ -171,6 +183,7 @@ def render_metro_svg(
         mx, my = (na.x + nb.x) / 2, (na.y + nb.y) / 2
 
         if tr.is_diff_name:
+            # 異駅名乗換（溜池山王 ↔ 国会議事堂前）は連絡通路を表す破線で結ぶ
             stroke = "#DC2626" if is_disabled else ("#0F172A" if is_active else "#64748B")
             sw = "4.5" if is_active else "3.0"
             parts.append(
@@ -180,7 +193,7 @@ def render_metro_svg(
                 f"<title>異駅名公式乗換: {html.escape(tr.label)}（{html.escape(tr.note)}）</title></line>"
             )
         else:
-            # Capsule connecting the two vertically stacked nodes
+            # 同一駅名での乗換（赤坂見附・銀座）は縦に並んだ 2 ノードをカプセル型枠で囲む
             top_y = min(na.y, nb.y) - 11
             height = abs(nb.y - na.y) + 22
             x_left = na.x - 11
@@ -193,6 +206,7 @@ def render_metro_svg(
                 f"<title>乗換駅: {html.escape(tr.label)}（{html.escape(tr.note)}）</title></rect>"
             )
 
+        # 乗換無効化中は赤い ✕、現在の経路で実際に乗り換える駅には黒い「乗換」バッジを表示
         if is_disabled:
             badge_x = mx + (24 if not tr.is_diff_name else 0)
             parts.append(
@@ -209,7 +223,7 @@ def render_metro_svg(
                 f"</g>"
             )
 
-    # 5. Station nodes & labels
+    # レイヤー 5: 各駅ノード（丸アイコン）と駅名テキスト
     origin_nodes = set(graph.station_name_to_nodes.get(origin_station or "", []))
     dest_nodes = set(graph.station_name_to_nodes.get(destination_station or "", []))
 
@@ -233,6 +247,7 @@ def render_metro_svg(
             f"<title>{html.escape(node.station_name)} ({node.code} / {graph.lines[node.line_id].name})</title></circle>"
         )
 
+        # 同一駅名で 2 ノードが近接する駅（例: 銀座の G-09 と M-16）は hide_label=True で重複描画を防ぐ
         if not node.hide_label:
             label_opacity = "1.0" if (not has_active or is_in_active or node.is_major or node.station_name in (origin_station, destination_station)) else "0.48"
             font_weight = "700" if (node.is_major or is_in_active or node.station_name in (origin_station, destination_station)) else "500"
@@ -245,7 +260,7 @@ def render_metro_svg(
                 f"{html.escape(node.station_name)}</text>"
             )
 
-    # 6. Origin ("発") and Destination ("着") callout badges
+    # レイヤー 6: 出発駅（「発」）と目的駅（「着」）の吹き出しピン
     def _draw_pin(node_id: str, tag: str, bg_color: str) -> None:
         node = graph.nodes[node_id]
         py = node.y - 24
@@ -257,6 +272,7 @@ def render_metro_svg(
             f"</g>"
         )
 
+    # 経路が見つかっていれば実際に使う発着ホームにピンを立て、未到達時は代表ホームに立てる
     if active_route is not None:
         _draw_pin(active_route.node_ids[0], "発", "#059669")
         if active_route.node_ids[-1] != active_route.node_ids[0]:
@@ -267,7 +283,7 @@ def render_metro_svg(
         if destination_station and destination_station in graph.station_name_to_nodes and destination_station != origin_station:
             _draw_pin(graph.station_name_to_nodes[destination_station][0], "着", "#1D4ED8")
 
-    # Branch label helper text
+    # 方南町支線エリアの補助注記
     parts.append(
         '<text x="155" y="405" font-size="11" font-weight="600" fill="#DC2626" opacity="0.85" text-anchor="end">丸ノ内線</text>'
     )

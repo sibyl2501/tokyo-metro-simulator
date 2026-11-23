@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>東京メトロ 乗換シミュレーター</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- ヘッダー -->
+    <header class="app-header">
+      <div class="header-title-row">
+        <h1>🚇 東京メトロ 乗換シミュレーター</h1>
+        <span class="pill-tech">FastAPI + PyTorch</span>
+      </div>
+      <p class="header-caption">
+        MVP（銀座線・丸ノ内線＋方南町支線）｜「この駅で乗り換えられなかったら？」「区間が止まったら？」を路線図上で実験し、PyTorchで自分の経路の好みを学習します。
+      </p>
+    </header>
+
+    <!-- クイック体験シナリオバー -->
+    <section class="preset-section" aria-label="クイック体験シナリオ">
+      <div class="section-label">クイック体験シナリオ</div>
+      <div class="preset-grid">
+        <button type="button" class="btn btn-preset" data-preset="normal">浅草→新宿（通常）</button>
+        <button type="button" class="btn btn-preset" data-preset="ginza_ng">浅草→新宿（銀座乗換NG）</button>
+        <button type="button" class="btn btn-preset" data-preset="shibuya_ginza">渋谷→銀座（0回 vs 短縮）</button>
+        <button type="button" class="btn btn-preset" data-preset="honancho">方南町→銀座（支線直通）</button>
+        <button type="button" class="btn btn-preset" data-preset="segment_closed">新宿→東京（霞ケ関手前閉鎖）</button>
+      </div>
+    </section>
+
+    <!-- メインタブ切替 -->
+    <nav class="tab-bar" role="tablist">
+      <button type="button" class="tab-btn active" role="tab" data-tab="sim" aria-selected="true">
+        🗺️ 乗換シミュレーター
+      </button>
+      <button type="button" class="tab-btn" role="tab" data-tab="ml" aria-selected="false">
+        🧠 PyTorch 好み学習 &amp; Colab連携
+      </button>
+    </nav>
+
+    <!-- =================================================================== -->
+    <!-- TAB 1: 乗換シミュレーター                                            -->
+    <!-- =================================================================== -->
+    <main id="tab-sim" class="tab-panel active">
+      <!-- 発着駅 & 優先条件バー -->
+      <section class="search-bar">
+        <div class="field">
+          <label for="origin-select">出発駅</label>
+          <select id="origin-select"></select>
+        </div>
+
+        <div class="field field-swap">
+          <button type="button" id="swap-btn" class="btn btn-icon" title="出発駅と目的駅を入れ替え" aria-label="出発駅と目的駅を入れ替え">
+            ⇄
+          </button>
+        </div>
+
+        <div class="field">
+          <label for="destination-select">目的駅</label>
+          <select id="destination-select"></select>
+        </div>
+
+        <div class="field field-priority">
+          <label for="priority-select">優先条件</label>
+          <select id="priority-select">
+            <option value="fewest_transfers">乗換が少ない順（ダイクストラ）</option>
+            <option value="fewest_stops">乗車区間数が少ない順（ダイクストラ）</option>
+            <option value="learned" id="learned-option" hidden>✨ PyTorch 好み学習順（再ランキング）</option>
+          </select>
+        </div>
+      </section>
+
+      <!-- 制約シミュレーションパネル -->
+      <section class="constraints-card">
+        <div class="constraints-col">
+          <div class="constraints-title">🚫 この駅で乗り換えられなかったら？（乗換無効化）</div>
+          <p class="constraints-caption">乗換のみ無効にします。その駅を通過する列車は引き続き利用できます。</p>
+          <div id="transfer-checkboxes" class="transfer-checkboxes"></div>
+        </div>
+
+        <div class="constraints-col">
+          <div class="constraints-title">🚧 区間そのものを閉じるモード（運休シミュレーション）</div>
+          <p class="constraints-caption">選択した隣駅間の線路（双方向）を閉鎖して迂回経路を調べます。</p>
+          <div class="segment-picker">
+            <select id="segment-add-select" aria-label="閉鎖する区間を追加">
+              <option value="">閉鎖したい区間を選択して追加...</option>
+            </select>
+            <div id="closed-segment-chips" class="chip-list"></div>
+          </div>
+        </div>
+
+        <div class="constraints-reset">
+          <button type="button" id="reset-constraints-btn" class="btn btn-secondary">制約を解除</button>
+        </div>
+      </section>
+
+      <!-- 2 カラムメイン（左: SVG 路線図 & 変更前後比較 / 右: 候補一覧） -->
+      <section class="sim-grid">
+        <div class="map-column">
+          <div id="svg-container" class="svg-container">
+            <div class="loading-placeholder">路線図を読み込んでいます...</div>
+          </div>
+
+          <!-- 制約有効時のみ表示される変更前後比較 -->
+          <div id="comparison-section" class="comparison-section" hidden>
+            <h3>🔄 変更前後の比較（どの乗換駅・迂回ルートが代わりを担えるか）</h3>
+            <div class="comparison-grid">
+              <div class="comparison-col">
+                <div class="comparison-label">変更前（制約なし・第1候補）</div>
+                <div id="baseline-box" class="diff-box"></div>
+              </div>
+              <div class="comparison-col">
+                <div class="comparison-label">変更後（現在の制約・第1候補）</div>
+                <div id="active-box" class="diff-box diff-box-after"></div>
+              </div>
+            </div>
+            <p id="dropped-caption" class="dropped-caption" hidden></p>
+          </div>
+        </div>
+
+        <aside class="list-column">
+          <h2 id="candidates-heading" class="column-heading">経路候補</h2>
+          <div id="status-banner" class="notice-box" hidden></div>
+
+          <div id="summary-table-wrap" class="table-wrap" hidden>
+            <table class="data-table">
+              <thead>
+                <tr id="summary-thead-row"></tr>
+              </thead>
+              <tbody id="summary-tbody"></tbody>
+            </table>
+          </div>
+
+          <div id="candidate-cards" class="candidate-cards"></div>
+        </aside>
+      </section>
+    </main>
+
+    <!-- =================================================================== -->
+    <!-- TAB 2: PyTorch 好み学習 & Colab 連携                                 -->
+    <!-- =================================================================== -->
+    <section id="tab-ml" class="tab-panel" hidden>
+      <div class="ml-intro">
+        <h2>🧠 PyTorchで自分の経路の好みを学習する</h2>
+        <p>
+          シミュレーター画面で <strong>「👍 私ならこの経路を選ぶ」</strong> を押すと、その時表示されていた候補一覧と選択結果が
+          <code>data/user_choices.jsonl</code> に蓄積されます。PyTorchの線形効用モデル（Multinomial Logit / Listwise Cross-Entropy）を
+          初期重み <code>0</code> から学習し、<strong>「乗換を1回減らすためなら何駅分の遠回りを許容するか」</strong> を推定して候補を並べ替えます。
+        </p>
+      </div>
+
+      <!-- KPI メトリクス -->
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">記録済み選択ログ</div>
+          <div id="metric-logs-total" class="metric-value">0 件</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">学習に使えるログ（2候補以上）</div>
+          <div id="metric-logs-usable" class="metric-value">0 件</div>
+        </div>
+        <div class="metric-card">
+          <div id="metric-model-label" class="metric-label">学習済みモデル</div>
+          <div id="metric-model-value" class="metric-value">未学習</div>
+        </div>
+      </div>
+
+      <!-- 学習・サンプル投入・リセット操作ボタン -->
+      <div class="ml-actions">
+        <button type="button" id="btn-train" class="btn btn-primary" disabled>🚀 今すぐPyTorchで学習する</button>
+        <button type="button" id="btn-sample-avoid" class="btn btn-secondary">🧪 サンプル投入（乗換回避派）</button>
+        <button type="button" id="btn-sample-short" class="btn btn-secondary">⚡ サンプル投入（駅数最短派）</button>
+        <button type="button" id="btn-ml-reset" class="btn btn-danger-outline">🗑️ リセット</button>
+      </div>
+
+      <!-- 学習結果セクション（学習済みモデルがある場合のみ表示） -->
+      <div id="ml-results-section" class="ml-results" hidden>
+        <hr class="divider" />
+        <h3>📊 学習結果の解釈</h3>
+        <div id="ml-interpretation" class="notice-box notice-info"></div>
+
+        <div class="charts-grid">
+          <div class="chart-card">
+            <div class="chart-title">学習された特徴量の重み（値が大きいほど好まれる・負ほど避けられる）</div>
+            <div id="weights-chart" class="weights-chart"></div>
+            <p id="ml-train-caption" class="chart-caption"></p>
+          </div>
+
+          <div class="chart-card">
+            <div class="chart-title">学習Lossの推移（エポックごと）</div>
+            <div id="loss-chart" class="loss-chart"></div>
+          </div>
+        </div>
+
+        <h3>🔀 学習前後の並び順比較（代表ルート）</h3>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>区間</th>
+                <th>駅数最短順 1位</th>
+                <th>PyTorch学習後 1位</th>
+                <th>順位変化</th>
+              </tr>
+            </thead>
+            <tbody id="ml-comparison-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ログ一覧 & Colab ダウンロード -->
+      <hr class="divider" />
+      <div class="logs-header">
+        <div>
+          <h3>📁 選択ログ一覧 &amp; Google Colab 連携</h3>
+          <p class="constraints-caption">
+            ダウンロードした <code>user_choices.jsonl</code> を <code>notebooks/tokyo_metro_preference_colab.ipynb</code> にアップロードすると、Colab上で学習・モデル比較・並び順変化の分析を実行できます。
+          </p>
+        </div>
+        <a id="btn-download-jsonl" href="/api/ml/logs/download" class="btn btn-secondary" hidden>
+          ⬇️ Colab用にJSONLをダウンロード
+        </a>
+      </div>
+
+      <div id="ml-logs-empty" class="notice-box notice-info">
+        まだ選択ログがありません。「乗換シミュレーター」タブで「👍 私ならこの経路を選ぶ」を押すか、上のサンプル投入ボタンをお試しください。
+      </div>
+
+      <div id="ml-logs-table-wrap" class="table-wrap" hidden>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>出発</th>
+              <th>目的</th>
+              <th>選んだ経路</th>
+              <th>候補数</th>
+              <th>無効乗換</th>
+            </tr>
+          </thead>
+          <tbody id="ml-logs-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <!-- トースト通知コンテナ -->
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

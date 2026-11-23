@@ -1,13 +1,26 @@
-"""Streamlit App: 東京メトロ 乗換シミュレーター（MVP: 銀座線＋丸ノ内線）."""
+"""FastAPI Web アプリ本体: 東京メトロ 乗換シミュレーター（MVP: 銀座線＋丸ノ内線）.
+
+Streamlit 版から FastAPI ＋ HTML/CSS/JS 構成へ完全移行したメインサーバーです。
+既存のコアモジュール（src/metro_graph.py, src/routing.py, src/preference_model.py,
+src/formatter.py, src/map_renderer.py）をそのまま呼び出し、JSON API として提供します。
+
+【この構成のメリット】
+  - 駅選択や制約の切り替えのたびに画面全体を再実行せず、fetch API で路線図と候補だけを瞬時に更新
+  - `python app.py` または `uvicorn app:app --reload` のどちらでも起動可能
+  - `/docs` を開けば FastAPI 自動生成の Swagger UI から各 API を直接テスト可能
+"""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-import pandas as pd
-import streamlit as st
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from src.map_renderer import render_metro_svg
 from src.metro_graph import MetroGraph
@@ -24,256 +37,141 @@ from src.preference_model import (
 )
 from src.routing import RouteCandidate, search_routes
 
-st.set_page_config(
-    page_title="東京メトロ 乗換シミュレーター",
-    page_icon="🚇",
-    layout="wide",
-    initial_sidebar_state="collapsed",
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+
+# FastAPI アプリケーション本体
+app = FastAPI(
+    title="東京メトロ 乗換シミュレーター API",
+    description="銀座線・丸ノ内線（方南町支線含む）の経路探索・障害シミュレーション・PyTorch 好み学習 API",
+    version="2.0.0",
 )
 
-# Subtle custom CSS for clean card presentation
-st.markdown(
-    """
-    <style>
-    .route-card {
-        border: 1px solid #E2E8F0;
-        border-radius: 12px;
-        padding: 12px 14px;
-        margin-bottom: 10px;
-        background: #FFFFFF;
+# 路線グラフは起動時に 1 回だけメモリへ読み込んで全リクエストで共有する
+graph = MetroGraph.from_json()
+
+# 選択ログ・学習済みモデルの保存パスと直近の Loss 推移を app.state で管理
+# （テスト時はここを tmp_path に差し替えることで本番データを汚さずに API テストできる）
+app.state.log_path = DEFAULT_LOG_PATH
+app.state.model_path = DEFAULT_MODEL_PATH
+app.state.last_loss_history: List[float] = []
+
+# フロントエンドの静的ファイル（CSS / JS）を /static 配下で配信
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ==============================================================================
+# リクエストスキーマ（Pydantic による自動バリデーション）
+# ==============================================================================
+class SearchRequest(BaseModel):
+    """経路検索および SVG 路線図生成のリクエストボディ."""
+
+    origin: str = Field(..., description="出発駅名（例: '浅草'）")
+    destination: str = Field(..., description="目的駅名（例: '新宿'）")
+    priority: Literal["fewest_transfers", "fewest_stops", "learned"] = Field(
+        default="fewest_transfers",
+        description="優先条件（乗換少ない順 / 駅数少ない順 / PyTorch好み学習順）",
+    )
+    disabled_transfers: List[str] = Field(
+        default_factory=list,
+        description="乗換無効化する公式乗換 ID リスト",
+    )
+    closed_segments: List[str] = Field(
+        default_factory=list,
+        description="閉鎖する隣駅区間 ID リスト",
+    )
+    selected_index: int = Field(
+        default=0,
+        ge=0,
+        description="路線図上でハイライト表示する候補の 0 始まりインデックス",
+    )
+
+
+class ChoiceLogRequest(BaseModel):
+    """「👍 私ならこの経路を選ぶ」ボタン押下時の選択ログ記録リクエスト."""
+
+    origin: str
+    destination: str
+    priority: Literal["fewest_transfers", "fewest_stops", "learned"] = "fewest_transfers"
+    disabled_transfers: List[str] = Field(default_factory=list)
+    closed_segments: List[str] = Field(default_factory=list)
+    chosen_index: int = Field(..., ge=0)
+
+
+class SampleLogRequest(BaseModel):
+    """デモ・検証用サンプル選択ログ生成リクエスト."""
+
+    persona: Literal["avoid_transfers", "shortest_stops"] = "avoid_transfers"
+
+
+class TrainRequest(BaseModel):
+    """PyTorch 好み学習のハイパーパラメータ設定."""
+
+    epochs: int = Field(default=250, ge=10, le=2000)
+    lr: float = Field(default=0.08, gt=0.0, le=1.0)
+    weight_decay: float = Field(default=0.02, ge=0.0, le=1.0)
+
+
+# ==============================================================================
+# 内部ヘルパー関数
+# ==============================================================================
+def _serialize_candidate(cand: RouteCandidate) -> Dict[str, Any]:
+    """RouteCandidate をフロントエンド描画用の JSON 辞書へ変換する."""
+    return {
+        "signature": cand.signature,
+        "title": cand.title,
+        "guidance": cand.guidance,
+        "stops": cand.stops,
+        "transfers": cand.transfers,
+        "diff_name_transfers": cand.diff_name_transfers,
+        "transfer_timing": round(cand.transfer_timing, 4),
+        "score": cand.score,
+        "legs": [
+            {
+                "line_id": leg.line_id,
+                "line_name": leg.line_name,
+                "direction_label": leg.direction_label,
+                "station_names": leg.station_names,
+                "stops": leg.stops,
+                "is_branch_leg": leg.is_branch_leg,
+            }
+            for leg in cand.legs
+        ],
+        "transfer_steps": [
+            {
+                "transfer_id": step.transfer_id,
+                "transfer_label": step.transfer_label,
+                "from_station": step.from_station,
+                "to_station": step.to_station,
+                "is_diff_name": step.is_diff_name,
+            }
+            for step in cand.transfer_steps
+        ],
     }
-    .route-card-selected {
-        border: 2px solid #0F172A;
-        background: #F8FAFC;
-    }
-    .badge {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 999px;
-        font-size: 0.78rem;
-        font-weight: 700;
-        margin-right: 6px;
-    }
-    .badge-g { background: #FF9500; color: #FFFFFF; }
-    .badge-m { background: #F62E36; color: #FFFFFF; }
-    .badge-stat { background: #F1F5F9; color: #0F172A; border: 1px solid #CBD5E1; }
-    .badge-score { background: #EDE9FE; color: #5B21B6; border: 1px solid #C4B5FD; }
-    .diff-box {
-        border-radius: 12px;
-        padding: 12px 16px;
-        border: 1px solid #CBD5E1;
-        background: #F8FAFC;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 
-@st.cache_resource
-def get_graph() -> MetroGraph:
-    return MetroGraph.from_json()
-
-
-graph = get_graph()
-station_names = graph.get_station_names()
-transfers_list = graph.get_ordered_transfers()
-segments_list = graph.get_ordered_segments()
-segment_id_to_label = {s.id: s.label for s in segments_list}
-transfer_id_to_label = {t.id: t.label for t in transfers_list}
-
-
-def init_state() -> None:
-    defaults = {
-        "origin_select": "浅草",
-        "destination_select": "新宿",
-        "priority_select": "fewest_transfers",
-        "disabled_transfers": [],
-        "closed_segments_select": [],
-        "selected_candidate_idx": 0,
-        "last_loss_history": [],
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-    for tr in transfers_list:
-        chk_key = f"chk_{tr.id}"
-        if chk_key not in st.session_state:
-            st.session_state[chk_key] = tr.id in st.session_state.disabled_transfers
-
-
-init_state()
-
-
-def apply_preset(
+def _run_search_pair(
     origin: str,
     destination: str,
-    priority: str = "fewest_transfers",
-    disabled_transfers: Optional[List[str]] = None,
-    closed_segments: Optional[List[str]] = None,
-) -> None:
-    dis_list = list(disabled_transfers or [])
-    cls_list = list(closed_segments or [])
-    st.session_state.origin_select = origin
-    st.session_state.destination_select = destination
-    st.session_state.priority_select = priority
-    st.session_state.disabled_transfers = dis_list
-    st.session_state.closed_segments_select = cls_list
-    for tr in transfers_list:
-        st.session_state[f"chk_{tr.id}"] = tr.id in dis_list
-    st.session_state.selected_candidate_idx = 0
+    priority: str,
+    disabled_transfers: List[str],
+    closed_segments: List[str],
+) -> tuple[List[RouteCandidate], List[RouteCandidate], bool]:
+    """制約なし（baseline）と制約あり（active）の両方の経路候補を計算する.
 
+    Returns:
+        (baseline_candidates, active_candidates, has_trained_model)
+    """
+    if origin not in graph.station_name_to_nodes:
+        raise HTTPException(status_code=400, detail=f"存在しない出発駅です: {origin}")
+    if destination not in graph.station_name_to_nodes:
+        raise HTTPException(status_code=400, detail=f"存在しない目的駅です: {destination}")
 
-def swap_stations() -> None:
-    st.session_state.origin_select, st.session_state.destination_select = (
-        st.session_state.destination_select,
-        st.session_state.origin_select,
-    )
-    st.session_state.selected_candidate_idx = 0
+    bundle = load_saved_model(app.state.model_path)
+    trained_model = bundle[0] if bundle else None
+    has_trained_model = trained_model is not None
 
-
-def reset_constraints() -> None:
-    st.session_state.disabled_transfers = []
-    st.session_state.closed_segments_select = []
-    for tr in transfers_list:
-        st.session_state[f"chk_{tr.id}"] = False
-    st.session_state.selected_candidate_idx = 0
-
-
-def reset_ml_state() -> None:
-    clear_choice_logs(DEFAULT_LOG_PATH, DEFAULT_MODEL_PATH)
-    st.session_state.last_loss_history = []
-    st.session_state.priority_select = "fewest_transfers"
-
-
-# Header
-st.title("🚇 東京メトロ 乗換シミュレーター")
-st.caption(
-    "MVP（銀座線・丸ノ内線＋方南町支線）｜「この駅で乗り換えられなかったら？」「区間が止まったら？」を路線図上で実験し、PyTorchで自分の経路の好みを学習します。"
-)
-
-# Preset scenarios bar
-st.markdown("**クイック体験シナリオ**")
-p_cols = st.columns(5)
-with p_cols[0]:
-    st.button(
-        "浅草→新宿（通常）",
-        width="stretch",
-        on_click=apply_preset,
-        args=("浅草", "新宿", "fewest_transfers", [], []),
-    )
-with p_cols[1]:
-    st.button(
-        "浅草→新宿（銀座乗換NG）",
-        width="stretch",
-        on_click=apply_preset,
-        args=("浅草", "新宿", "fewest_transfers", ["transfer:銀座"], []),
-    )
-with p_cols[2]:
-    st.button(
-        "渋谷→銀座（0回 vs 短縮）",
-        width="stretch",
-        on_click=apply_preset,
-        args=("渋谷", "銀座", "fewest_stops", [], []),
-    )
-with p_cols[3]:
-    st.button(
-        "方南町→銀座（支線直通）",
-        width="stretch",
-        on_click=apply_preset,
-        args=("方南町", "銀座", "fewest_transfers", [], []),
-    )
-with p_cols[4]:
-    st.button(
-        "新宿→東京（霞ケ関手前閉鎖）",
-        width="stretch",
-        on_click=apply_preset,
-        args=("新宿", "東京", "fewest_transfers", [], ["M-14__M-15"]),
-    )
-
-tab_sim, tab_ml = st.tabs(["🗺️ 乗換シミュレーター", "🧠 PyTorch 好み学習 & Colab連携"])
-
-saved_model_bundle = load_saved_model(DEFAULT_MODEL_PATH)
-trained_model = saved_model_bundle[0] if saved_model_bundle else None
-trained_summary = saved_model_bundle[1] if saved_model_bundle else None
-
-# ==============================================================================
-# TAB 1: ROUTE SIMULATOR
-# ==============================================================================
-with tab_sim:
-    # Top search controls
-    c1, c_swap, c2, c3 = st.columns([3, 0.7, 3, 3.2])
-    with c1:
-        origin = st.selectbox(
-            "出発駅",
-            options=station_names,
-            format_func=graph.get_station_display_label,
-            key="origin_select",
-        )
-    with c_swap:
-        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        st.button("⇄", help="出発駅と目的駅を入れ替え", width="stretch", on_click=swap_stations)
-    with c2:
-        destination = st.selectbox(
-            "目的駅",
-            options=station_names,
-            format_func=graph.get_station_display_label,
-            key="destination_select",
-        )
-    with c3:
-        priority_options = ["fewest_transfers", "fewest_stops"]
-        if trained_model is not None:
-            priority_options.append("learned")
-        if st.session_state.priority_select not in priority_options:
-            st.session_state.priority_select = "fewest_transfers"
-        priority_labels = {
-            "fewest_transfers": "乗換が少ない順（ダイクストラ）",
-            "fewest_stops": "乗車区間数が少ない順（ダイクストラ）",
-            "learned": "✨ PyTorch 好み学習順（再ランキング）",
-        }
-        priority = st.selectbox(
-            "優先条件",
-            options=priority_options,
-            format_func=lambda p: priority_labels[p],
-            key="priority_select",
-        )
-
-    # Disruption controls ("この駅で乗り換えられなかったら？" & 区間閉鎖)
-    with st.container(border=True):
-        ctrl_left, ctrl_right, ctrl_reset = st.columns([4.5, 4.5, 1.3])
-        with ctrl_left:
-            st.markdown("**🚫 この駅で乗り換えられなかったら？（乗換無効化）**")
-            st.caption("乗換のみ無効にします。その駅を通過する列車は引き続き利用できます。")
-            new_disabled: List[str] = []
-            tr_cols = st.columns(len(transfers_list))
-            for col, tr in zip(tr_cols, transfers_list):
-                with col:
-                    checked = st.checkbox(
-                        tr.label,
-                        key=f"chk_{tr.id}",
-                        help=tr.note,
-                    )
-                    if checked:
-                        new_disabled.append(tr.id)
-            st.session_state.disabled_transfers = new_disabled
-
-        with ctrl_right:
-            st.markdown("**🚧 区間そのものを閉じるモード（運休シミュレーション）**")
-            st.caption("選択した隣駅間の線路（双方向）を閉鎖して迂回経路を調べます。")
-            closed_selected = st.multiselect(
-                "閉鎖する区間",
-                options=[s.id for s in segments_list],
-                format_func=lambda sid: segment_id_to_label[sid],
-                label_visibility="collapsed",
-                placeholder="閉鎖したい区間を選択（複数可）...",
-                key="closed_segments_select",
-            )
-
-        with ctrl_reset:
-            st.markdown("<div style='height:26px'></div>", unsafe_allow_html=True)
-            st.button("制約を解除", width="stretch", on_click=reset_constraints)
-
-    # Run routing (baseline without disruptions + active with current disruptions)
     base_priority = "fewest_transfers" if priority == "learned" else priority
     baseline_candidates = search_routes(
         graph=graph,
@@ -288,344 +186,286 @@ with tab_sim:
         destination_station=destination,
         priority=base_priority,
         max_candidates=5,
-        disabled_transfers=st.session_state.disabled_transfers,
-        closed_segments=closed_selected,
+        disabled_transfers=disabled_transfers,
+        closed_segments=closed_segments,
     )
 
     if priority == "learned" and trained_model is not None:
         baseline_candidates = rerank_candidates(baseline_candidates, trained_model)
         active_candidates = rerank_candidates(active_candidates, trained_model)
 
-    if st.session_state.selected_candidate_idx >= len(active_candidates):
-        st.session_state.selected_candidate_idx = 0
-
-    selected_route: Optional[RouteCandidate] = (
-        active_candidates[st.session_state.selected_candidate_idx] if active_candidates else None
-    )
-    baseline_top: Optional[RouteCandidate] = baseline_candidates[0] if baseline_candidates else None
-    has_constraints = bool(st.session_state.disabled_transfers or closed_selected)
-
-    # Main 2-column visualization + candidates panel
-    map_col, list_col = st.columns([6.3, 3.7], gap="large")
-
-    with map_col:
-        svg_html = render_metro_svg(
-            graph=graph,
-            active_route=selected_route,
-            baseline_route=baseline_top if has_constraints else None,
-            disabled_transfers=st.session_state.disabled_transfers,
-            closed_segments=closed_selected,
-            origin_station=origin,
-            destination_station=destination,
-        )
-        st.markdown(svg_html, unsafe_allow_html=True)
-
-        # Before vs After Comparison Section (shown whenever constraints are active)
-        if has_constraints:
-            st.markdown("#### 🔄 変更前後の比較（どの乗換駅・迂回ルートが代わりを担えるか）")
-            comp_left, comp_right = st.columns(2)
-            with comp_left:
-                st.markdown("**変更前（制約なし・第1候補）**")
-                if baseline_top:
-                    st.markdown(
-                        f"""<div class="diff-box">
-                        <b>{baseline_top.title}</b><br/>
-                        <span class="badge badge-stat">乗換 {baseline_top.transfers}回</span>
-                        <span class="badge badge-stat">乗車 {baseline_top.stops}区間</span><br/>
-                        <div style="margin-top:6px;font-size:0.9rem;color:#334155;">{baseline_top.guidance}</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.info("変更前の候補はありません。")
-            with comp_right:
-                st.markdown("**変更後（現在の制約・第1候補）**")
-                if active_candidates:
-                    new_top = active_candidates[0]
-                    if baseline_top and new_top.signature == baseline_top.signature:
-                        delta_html = '<span style="color:#059669;font-weight:700;">変化なし（制約の影響を受けない経路です）</span>'
-                    elif baseline_top:
-                        d_tr = new_top.transfers - baseline_top.transfers
-                        d_st = new_top.stops - baseline_top.stops
-                        d_tr_str = f"{d_tr:+d}回"
-                        d_st_str = f"{d_st:+d}区間"
-                        delta_html = (
-                            f'<span style="color:#B45309;font-weight:700;">'
-                            f"代替経路に切替（乗換 {d_tr_str} / 乗車 {d_st_str}）</span>"
-                        )
-                    else:
-                        delta_html = ""
-                    st.markdown(
-                        f"""<div class="diff-box" style="border-color:#F59E0B;background:#FFFBEB;">
-                        <b>{new_top.title}</b> {delta_html}<br/>
-                        <span class="badge badge-stat">乗換 {new_top.transfers}回</span>
-                        <span class="badge badge-stat">乗車 {new_top.stops}区間</span><br/>
-                        <div style="margin-top:6px;font-size:0.9rem;color:#334155;">{new_top.guidance}</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.error("到達可能な経路がありません（すべての接続が遮断されています）。")
-
-            # Show dropped routes summary
-            active_sigs = {c.signature for c in active_candidates}
-            dropped = [c for c in baseline_candidates if c.signature not in active_sigs]
-            if dropped:
-                dropped_names = "、".join(c.title for c in dropped)
-                st.caption(f"除外された候補: {dropped_names}")
-
-    with list_col:
-        st.subheader(f"経路候補（{origin} → {destination}）")
-        if origin == destination:
-            st.info("出発駅と目的駅が同じです。別の駅を選んでください。")
-        elif not active_candidates:
-            st.error(
-                "指定した条件では目的駅に到達できません。無効化した乗換または閉鎖区間を一部解除してみてください。"
-            )
-        else:
-            # Summary comparison table matching design spec
-            summary_rows = [
-                {
-                    "順位": f"#{i + 1}",
-                    "候補": c.title,
-                    "乗換": f"{c.transfers}回",
-                    "乗車": f"{c.stops}区間",
-                    **(
-                        {"好みスコア": f"{c.score:+.2f}"}
-                        if priority == "learned" and c.score is not None
-                        else {}
-                    ),
-                }
-                for i, c in enumerate(active_candidates)
-            ]
-            st.dataframe(pd.DataFrame(summary_rows), hide_index=True, width="stretch")
-
-            # Detailed candidate cards with preview & "私ならこの経路を選ぶ" button
-            for idx, cand in enumerate(active_candidates):
-                is_sel = idx == st.session_state.selected_candidate_idx
-                card_cls = "route-card route-card-selected" if is_sel else "route-card"
-
-                leg_badges = ""
-                for leg in cand.legs:
-                    cls = "badge-g" if leg.line_id == "G" else "badge-m"
-                    leg_badges += (
-                        f'<span class="badge {cls}">{leg.line_id} {leg.line_name} '
-                        f"({leg.stops}区間)</span>"
-                    )
-                score_badge = (
-                    f'<span class="badge badge-score">好み {cand.score:+.2f}</span>'
-                    if priority == "learned" and cand.score is not None
-                    else ""
-                )
-                diff_badge = (
-                    '<span class="badge badge-stat">異駅名乗換あり</span>'
-                    if cand.diff_name_transfers > 0
-                    else ""
-                )
-
-                st.markdown(
-                    f"""<div class="{card_cls}">
-                    <div style="display:flex;justify-content:space-between;align-items:center;">
-                      <span style="font-weight:800;font-size:1.02rem;color:#0F172A;">
-                        {"▶ " if is_sel else ""}#{idx + 1} {cand.title}
-                      </span>
-                      <span>
-                        <span class="badge badge-stat">乗換 {cand.transfers}回</span>
-                        <span class="badge badge-stat">乗車 {cand.stops}区間</span>
-                        {score_badge}
-                      </span>
-                    </div>
-                    <div style="margin:6px 0;">{leg_badges}{diff_badge}</div>
-                    <div style="font-size:0.92rem;color:#1E293B;line-height:1.5;">{cand.guidance}</div>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-                b_col1, b_col2 = st.columns([1, 1.35])
-                with b_col1:
-                    if st.button(
-                        "路線図に表示中" if is_sel else "路線図で確認",
-                        key=f"preview_{idx}_{cand.signature}",
-                        disabled=is_sel,
-                        width="stretch",
-                    ):
-                        st.session_state.selected_candidate_idx = idx
-                        st.rerun()
-                with b_col2:
-                    if st.button(
-                        "👍 私ならこの経路を選ぶ",
-                        key=f"choose_{idx}_{cand.signature}",
-                        type="primary" if is_sel else "secondary",
-                        width="stretch",
-                    ):
-                        append_choice_log(
-                            origin=origin,
-                            destination=destination,
-                            priority_mode=priority,
-                            disabled_transfers=st.session_state.disabled_transfers,
-                            closed_segments=closed_selected,
-                            candidates=active_candidates,
-                            chosen_index=idx,
-                            log_path=DEFAULT_LOG_PATH,
-                        )
-                        st.toast(f"選択を記録しました：{cand.title}（{origin}→{destination}）", icon="✅")
-
-                with st.expander("停車駅・詳細を見る", expanded=False):
-                    for leg in cand.legs:
-                        st.markdown(
-                            f"- **{leg.line_name}（{leg.direction_label}）**：{' → '.join(leg.station_names)}"
-                        )
-                    if cand.transfer_steps:
-                        for t in cand.transfer_steps:
-                            tag = "（異駅名・連絡通路）" if t.is_diff_name else ""
-                            st.markdown(
-                                f"- **乗換**：{t.transfer_label}{tag}"
-                            )
+    return baseline_candidates, active_candidates, has_trained_model
 
 
-# ==============================================================================
-# TAB 2: PYTORCH PREFERENCE LEARNING & COLAB EXPORT
-# ==============================================================================
-with tab_ml:
-    st.subheader("🧠 PyTorchで自分の経路の好みを学習する")
-    st.markdown(
-        """
-        シミュレーター画面で **「👍 私ならこの経路を選ぶ」** を押すと、その時表示されていた候補一覧と選択結果が
-        `data/user_choices.jsonl` に蓄積されます。PyTorchの線形効用モデル（Multinomial Logit / Listwise Cross-Entropy）を
-        初期重み `0` から学習し、**「乗換を1回減らすためなら何駅分の遠回りを許容するか」** を推定して候補を並べ替えます。
-        """
-    )
-
-    logs = load_choice_logs(DEFAULT_LOG_PATH)
+def _build_ml_status() -> Dict[str, Any]:
+    """PyTorch 好み学習タブの表示に必要な最新ステータス一式を組み立てる."""
+    logs = load_choice_logs(app.state.log_path)
     usable_logs = [r for r in logs if len(r.get("candidates", [])) >= 2]
+    bundle = load_saved_model(app.state.model_path)
+    trained_model = bundle[0] if bundle else None
+    trained_summary = bundle[1] if bundle else None
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("記録済み選択ログ", f"{len(logs)} 件")
-    m2.metric("学習に使えるログ（2候補以上）", f"{len(usable_logs)} 件")
-    if trained_summary and trained_summary.get("transfer_equivalent_stops") is not None:
-        m3.metric(
-            "学習済み：乗換1回の許容遠回り",
-            f"約 {trained_summary['transfer_equivalent_stops']:.1f} 駅分",
-        )
-    else:
-        m3.metric("学習済みモデル", "学習済み" if trained_model else "未学習")
-
-    act1, act2, act3, act4 = st.columns([2.2, 2.2, 2.2, 1.4])
-    with act1:
-        if st.button("🚀 今すぐPyTorchで学習する", type="primary", width="stretch", disabled=len(usable_logs) == 0):
-            model, summary = train_preference_model(
-                records=logs,
-                epochs=250,
-                lr=0.08,
-                weight_decay=0.02,
-                save_path=DEFAULT_MODEL_PATH,
-            )
-            st.session_state.last_loss_history = summary.loss_history
-            st.success(
-                f"学習完了！（Loss: {summary.initial_loss:.4f} → {summary.final_loss:.4f} / "
-                f"Top-1一致率: {summary.top1_accuracy * 100:.1f}%）"
-            )
-            st.rerun()
-
-    with act2:
-        if st.button("🧪 サンプル投入（乗換回避派）", width="stretch"):
-            added = generate_sample_choice_logs(graph, persona="avoid_transfers", log_path=DEFAULT_LOG_PATH)
-            st.toast(f"乗換回避派のサンプル選択を {len(added)} 件追加しました。", icon="🧪")
-            st.rerun()
-
-    with act3:
-        if st.button("⚡ サンプル投入（駅数最短派）", width="stretch"):
-            added = generate_sample_choice_logs(graph, persona="shortest_stops", log_path=DEFAULT_LOG_PATH)
-            st.toast(f"駅数最短派のサンプル選択を {len(added)} 件追加しました。", icon="⚡")
-            st.rerun()
-
-    with act4:
-        st.button("🗑️ リセット", width="stretch", on_click=reset_ml_state)
-
-    # Show trained model analysis
-    if trained_model is not None and trained_summary is not None:
-        st.markdown("---")
-        st.markdown("#### 📊 学習結果の解釈")
-        st.info(f"**モデルの読み取り：** {trained_summary.get('interpretation', '')}")
-
-        res_left, res_right = st.columns(2)
-        with res_left:
-            st.markdown("**学習された特徴量の重み（値が大きいほど好まれる・負ほど避けられる）**")
-            weights_dict = trained_summary.get("weights", {})
-            w_df = pd.DataFrame(
-                {"特徴量": list(weights_dict.keys()), "重み": list(weights_dict.values())}
-            ).set_index("特徴量")
-            st.bar_chart(w_df)
-            st.caption(
-                f"学習イベント数: {trained_summary.get('num_events_used')}件 ｜ "
-                f"Loss: {trained_summary.get('initial_loss')} → {trained_summary.get('final_loss')} ｜ "
-                f"Top-1一致率: {trained_summary.get('top1_accuracy', 0) * 100:.1f}%"
-            )
-
-        with res_right:
-            if st.session_state.last_loss_history:
-                st.markdown("**学習Lossの推移（エポックごと）**")
-                loss_df = pd.DataFrame({"Cross-Entropy Loss": st.session_state.last_loss_history})
-                st.line_chart(loss_df)
-            else:
-                st.markdown("**並び順の変化チェック（標準 vs PyTorch学習後）**")
-                st.caption("「今すぐPyTorchで学習する」を押すとLoss推移も表示されます。")
-
-        # Side-by-side ranking comparison on representative pairs
-        st.markdown("#### 🔀 学習前後の並び順比較（代表ルート）")
+    # 学習済みモデルがある場合、代表 4 区間で「駅数最短順 vs PyTorch 学習後」の 1 位比較を作成
+    comparison_rows: List[Dict[str, Any]] = []
+    if trained_model is not None:
         compare_pairs = [
             ("浅草", "新宿"),
             ("渋谷", "銀座"),
             ("青山一丁目", "銀座"),
             ("渋谷", "東京"),
         ]
-        comp_rows = []
         for o_st, d_st in compare_pairs:
             std_cands = search_routes(graph, o_st, d_st, priority="fewest_stops", max_candidates=4)
             learned_cands = rerank_candidates(std_cands, trained_model)
             if std_cands and learned_cands:
-                comp_rows.append(
+                changed = std_cands[0].signature != learned_cands[0].signature
+                comparison_rows.append(
                     {
-                        "区間": f"{o_st} → {d_st}",
-                        "駅数最短順 1位": f"{std_cands[0].title}（乗換{std_cands[0].transfers}回 / {std_cands[0].stops}区間）",
-                        "PyTorch学習後 1位": f"{learned_cands[0].title}（乗換{learned_cands[0].transfers}回 / {learned_cands[0].stops}区間 / スコア{learned_cands[0].score:+.2f}）",
-                        "順位変化": "変化あり ✨" if std_cands[0].signature != learned_cands[0].signature else "同じ",
+                        "pair": f"{o_st} → {d_st}",
+                        "std_top": f"{std_cands[0].title}（乗換{std_cands[0].transfers}回 / {std_cands[0].stops}区間）",
+                        "learned_top": (
+                            f"{learned_cands[0].title}（乗換{learned_cands[0].transfers}回 / "
+                            f"{learned_cands[0].stops}区間 / スコア{learned_cands[0].score:+.2f}）"
+                        ),
+                        "changed": changed,
                     }
                 )
-        st.dataframe(pd.DataFrame(comp_rows), hide_index=True, width="stretch")
 
-    # Export / inspect logs for Google Colab
-    st.markdown("---")
-    col_log_l, col_log_r = st.columns([3, 1.4])
-    with col_log_l:
-        st.markdown("#### 📁 選択ログ一覧 & Google Colab 連携")
-        st.caption(
-            "ダウンロードした `user_choices.jsonl` を `notebooks/tokyo_metro_preference_colab.ipynb` にアップロードすると、Colab上で学習・モデル比較・並び順変化の分析を実行できます。"
-        )
-    with col_log_r:
-        if logs:
-            jsonl_payload = "\n".join(json.dumps(r, ensure_ascii=False) for r in logs) + "\n"
-            st.download_button(
-                label="⬇️ Colab用にJSONLをダウンロード",
-                data=jsonl_payload.encode("utf-8"),
-                file_name="user_choices.jsonl",
-                mime="application/jsonl",
-                width="stretch",
-            )
+    # 直近 20 件のログを新しい順でプレビュー用に整形
+    recent_logs = [
+        {
+            "origin": r.get("origin", ""),
+            "destination": r.get("destination", ""),
+            "chosen_title": r.get("chosen_title", ""),
+            "num_candidates": len(r.get("candidates", [])),
+            "disabled_transfers": ", ".join(r.get("disabled_transfers", [])) or "-",
+        }
+        for r in reversed(logs[-20:])
+    ]
 
-    if logs:
-        log_preview = [
-            {
-                "出発": r["origin"],
-                "目的": r["destination"],
-                "選んだ経路": r["chosen_title"],
-                "候補数": len(r.get("candidates", [])),
-                "無効乗換": ", ".join(r.get("disabled_transfers", [])) or "-",
-            }
-            for r in reversed(logs[-20:])
-        ]
-        st.dataframe(pd.DataFrame(log_preview), hide_index=True, width="stretch")
-    else:
-        st.info(
-            "まだ選択ログがありません。「乗換シミュレーター」タブで「👍 私ならこの経路を選ぶ」を押すか、上のサンプル投入ボタンをお試しください。"
+    return {
+        "logs_total": len(logs),
+        "usable_logs": len(usable_logs),
+        "has_trained_model": trained_model is not None,
+        "trained_summary": trained_summary,
+        "loss_history": list(app.state.last_loss_history),
+        "comparison_rows": comparison_rows,
+        "recent_logs": recent_logs,
+    }
+
+
+# ==============================================================================
+# HTML エントリーポイント & API ルート定義
+# ==============================================================================
+@app.get("/", include_in_schema=False)
+def serve_index() -> FileResponse:
+    """トップページ（SPA 風の単一 HTML）を返す."""
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/meta")
+def get_meta() -> Dict[str, Any]:
+    """UI 初期化に必要な駅一覧・乗換一覧・区間一覧・モデル有無を返す."""
+    stations = [
+        {"name": name, "label": graph.get_station_display_label(name)}
+        for name in graph.get_station_names()
+    ]
+    transfers = [
+        {
+            "id": tr.id,
+            "label": tr.label,
+            "note": tr.note,
+            "is_diff_name": tr.is_diff_name,
+        }
+        for tr in graph.get_ordered_transfers()
+    ]
+    segments = [
+        {
+            "id": seg.id,
+            "label": seg.label,
+            "line_id": seg.line_id,
+        }
+        for seg in graph.get_ordered_segments()
+    ]
+    has_trained_model = load_saved_model(app.state.model_path) is not None
+    return {
+        "stations": stations,
+        "transfers": transfers,
+        "segments": segments,
+        "has_trained_model": has_trained_model,
+    }
+
+
+@app.post("/api/search")
+def api_search_routes(req: SearchRequest) -> Dict[str, Any]:
+    """経路探索を実行し、候補一覧・変更前後比較データ・最新 SVG 路線図をまとめて返す."""
+    baseline_candidates, active_candidates, has_trained_model = _run_search_pair(
+        origin=req.origin,
+        destination=req.destination,
+        priority=req.priority,
+        disabled_transfers=req.disabled_transfers,
+        closed_segments=req.closed_segments,
+    )
+
+    selected_idx = req.selected_index if req.selected_index < len(active_candidates) else 0
+    selected_route = active_candidates[selected_idx] if active_candidates else None
+    baseline_top = baseline_candidates[0] if baseline_candidates else None
+    has_constraints = bool(req.disabled_transfers or req.closed_segments)
+
+    svg_html = render_metro_svg(
+        graph=graph,
+        active_route=selected_route,
+        baseline_route=baseline_top if has_constraints else None,
+        disabled_transfers=req.disabled_transfers,
+        closed_segments=req.closed_segments,
+        origin_station=req.origin,
+        destination_station=req.destination,
+    )
+
+    # 制約によって除外された候補名を抽出
+    active_sigs = {c.signature for c in active_candidates}
+    dropped_titles = [c.title for c in baseline_candidates if c.signature not in active_sigs]
+
+    # 変更前後の第 1 候補の差分サマリー
+    comparison: Optional[Dict[str, Any]] = None
+    if has_constraints:
+        new_top = active_candidates[0] if active_candidates else None
+        status = "unreachable"
+        delta_transfers = 0
+        delta_stops = 0
+        if new_top is not None:
+            if baseline_top is not None and new_top.signature == baseline_top.signature:
+                status = "unchanged"
+            else:
+                status = "changed"
+                if baseline_top is not None:
+                    delta_transfers = new_top.transfers - baseline_top.transfers
+                    delta_stops = new_top.stops - baseline_top.stops
+        comparison = {
+            "baseline_top": _serialize_candidate(baseline_top) if baseline_top else None,
+            "active_top": _serialize_candidate(new_top) if new_top else None,
+            "status": status,
+            "delta_transfers": delta_transfers,
+            "delta_stops": delta_stops,
+            "dropped_titles": dropped_titles,
+        }
+
+    return {
+        "origin": req.origin,
+        "destination": req.destination,
+        "same_station": req.origin == req.destination,
+        "priority": req.priority,
+        "has_trained_model": has_trained_model,
+        "has_constraints": has_constraints,
+        "selected_index": selected_idx,
+        "candidates": [_serialize_candidate(c) for c in active_candidates],
+        "comparison": comparison,
+        "svg": svg_html,
+    }
+
+
+@app.post("/api/choices")
+def api_record_choice(req: ChoiceLogRequest) -> Dict[str, Any]:
+    """ユーザーが選んだ経路を JSONL ログへ追記する."""
+    _, active_candidates, _ = _run_search_pair(
+        origin=req.origin,
+        destination=req.destination,
+        priority=req.priority,
+        disabled_transfers=req.disabled_transfers,
+        closed_segments=req.closed_segments,
+    )
+    if not active_candidates or req.chosen_index >= len(active_candidates):
+        raise HTTPException(status_code=400, detail="選択された候補インデックスが不正です。")
+
+    record = append_choice_log(
+        origin=req.origin,
+        destination=req.destination,
+        priority_mode=req.priority,
+        disabled_transfers=req.disabled_transfers,
+        closed_segments=req.closed_segments,
+        candidates=active_candidates,
+        chosen_index=req.chosen_index,
+        log_path=app.state.log_path,
+    )
+    return {
+        "message": f"選択を記録しました：{record['chosen_title']}（{req.origin}→{req.destination}）",
+        "chosen_title": record["chosen_title"],
+        "ml_status": _build_ml_status(),
+    }
+
+
+@app.get("/api/ml/status")
+def api_ml_status() -> Dict[str, Any]:
+    """選択ログ件数・学習済みモデルの重み・代表ルートの比較結果を返す."""
+    return _build_ml_status()
+
+
+@app.post("/api/ml/train")
+def api_ml_train(req: TrainRequest) -> Dict[str, Any]:
+    """蓄積された選択ログから PyTorch 好み学習モデルを学習して保存する."""
+    logs = load_choice_logs(app.state.log_path)
+    try:
+        _, summary = train_preference_model(
+            records=logs,
+            epochs=req.epochs,
+            lr=req.lr,
+            weight_decay=req.weight_decay,
+            save_path=app.state.model_path,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    app.state.last_loss_history = summary.loss_history
+    return {
+        "message": (
+            f"学習完了！（Loss: {summary.initial_loss:.4f} → {summary.final_loss:.4f} / "
+            f"Top-1一致率: {summary.top1_accuracy * 100:.1f}%）"
+        ),
+        "ml_status": _build_ml_status(),
+    }
+
+
+@app.post("/api/ml/sample")
+def api_ml_sample(req: SampleLogRequest) -> Dict[str, Any]:
+    """テスト・体験用の仮想ユーザー選択ログ（乗換回避派 / 駅数最短派）を一括追記する."""
+    added = generate_sample_choice_logs(
+        graph=graph,
+        persona=req.persona,
+        log_path=app.state.log_path,
+    )
+    label = "乗換回避派" if req.persona == "avoid_transfers" else "駅数最短派"
+    return {
+        "message": f"{label}のサンプル選択を {len(added)} 件追加しました。",
+        "added_count": len(added),
+        "ml_status": _build_ml_status(),
+    }
+
+
+@app.post("/api/ml/reset")
+def api_ml_reset() -> Dict[str, Any]:
+    """選択ログと学習済みモデルをすべて削除して初期状態へ戻す."""
+    clear_choice_logs(app.state.log_path, app.state.model_path)
+    app.state.last_loss_history = []
+    return {
+        "message": "選択ログと学習済みモデルをリセットしました。",
+        "ml_status": _build_ml_status(),
+    }
+
+
+@app.get("/api/ml/logs/download")
+def api_download_logs() -> Response:
+    """Google Colab 連携用に蓄積済みの user_choices.jsonl をダウンロード配信する."""
+    logs = load_choice_logs(app.state.log_path)
+    if not logs:
+        raise HTTPException(status_code=404, detail="ダウンロードできる選択ログがまだありません。")
+    payload = "\n".join(json.dumps(r, ensure_ascii=False) for r in logs) + "\n"
+    return Response(
+        content=payload.encode("utf-8"),
+        media_type="application/jsonl; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="user_choices.jsonl"'},
+    )
+
+
+if __name__ == "__main__":
+    # `python app.py` でそのままローカルサーバーを起動できるエントリーポイント
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
